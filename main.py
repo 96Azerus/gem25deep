@@ -1,8 +1,9 @@
-# main.py (v1.1.0)
+# main.py (v1.1.1)
 import asyncio
 import os
 import uuid
 import logging
+import json # <-- ИСПРАВЛЕНИЕ: Добавлен импорт json
 from typing import Dict, Any, AsyncGenerator, List
 
 from fastapi import FastAPI, Request, BackgroundTasks, HTTPException
@@ -12,21 +13,20 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 from sse_starlette.sse import EventSourceResponse
-import google.generativeai as genai # Импортируем основной модуль
+import google.generativeai as genai
 
 from researcher import DeepResearcher, ResearchError
 
 # --- Конфигурация ---
 load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-DEFAULT_MODEL_NAME = os.getenv("DEFAULT_MODEL_NAME", "gemini-2.5-pro-preview-03-25") # Модель по умолчанию
+DEFAULT_MODEL_NAME = os.getenv("DEFAULT_MODEL_NAME", "gemini-2.5-pro-preview-03-25")
 
 if not GEMINI_API_KEY:
     print("Ошибка: Переменная окружения GEMINI_API_KEY не установлена.")
     print("Пожалуйста, создайте файл .env и добавьте GEMINI_API_KEY='ВАШ_КЛЮЧ'")
     exit(1)
 
-# Настройка логирования
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -35,7 +35,6 @@ available_models: List[str] = []
 try:
     genai.configure(api_key=GEMINI_API_KEY)
     models_list = genai.list_models()
-    # Фильтруем модели, поддерживающие generateContent и не являющиеся embedding моделями
     available_models = sorted([
         m.name.replace("models/", "") for m in models_list
         if 'generateContent' in m.supported_generation_methods and 'embedding' not in m.name
@@ -45,22 +44,16 @@ try:
         DEFAULT_MODEL_NAME = available_models[0]
     elif not available_models:
          logger.error("Не удалось получить список доступных моделей Gemini.")
-         # Можно завершить работу или использовать жестко заданную модель
-         # exit(1)
-         available_models = [DEFAULT_MODEL_NAME] # Используем дефолтную, если список пуст
+         available_models = [DEFAULT_MODEL_NAME]
     logger.info(f"Доступные модели Gemini: {available_models}")
     logger.info(f"Модель по умолчанию: {DEFAULT_MODEL_NAME}")
 
 except Exception as e:
     logger.exception(f"Критическая ошибка при получении списка моделей Gemini: {e}")
-    # Завершаем работу, так как без моделей приложение бесполезно
     exit(1)
-
 
 # --- FastAPI Приложение ---
 app = FastAPI(title="Deep Research Engine")
-
-# Монтируем статические файлы и шаблоны
 app.mount("/static", StaticFiles(directory="static"), name="static")
 templates = Jinja2Templates(directory="templates")
 
@@ -82,7 +75,7 @@ class ResearchTask(BaseModel):
 research_tasks: Dict[str, ResearchTask] = {}
 task_events: Dict[str, asyncio.Queue] = {}
 
-# --- Логика SSE (без изменений) ---
+# --- Логика SSE ---
 async def research_event_generator(task_id: str) -> AsyncGenerator[str, None]:
     """Генератор Server-Sent Events для стриминга прогресса исследования."""
     queue = asyncio.Queue()
@@ -98,12 +91,11 @@ async def research_event_generator(task_id: str) -> AsyncGenerator[str, None]:
 
             new_logs = task.progress_log[last_log_index:]
             for log_entry in new_logs:
-                # Используем json.dumps для корректной обработки спецсимволов в логах
+                # ИСПРАВЛЕНИЕ: Используем импортированный json
                 yield f"data: {json.dumps({'type': 'log', 'content': log_entry})}\n\n"
             last_log_index = len(task.progress_log)
 
             if task.status == "completed":
-                # Используем json.dumps для отчета
                 yield f"data: {json.dumps({'type': 'report', 'content': task.final_report})}\n\n"
                 yield f"data: {json.dumps({'type': 'status', 'content': 'completed'})}\n\n"
                 break
@@ -133,7 +125,7 @@ async def cleanup_task(task_id: str, delay: int):
         logger.info(f"Задача {task_id} удалена из памяти.")
 
 # --- Фоновая задача исследования ---
-async def run_research_task(task_id: str, query: str, depth: int, breadth: int, model_name: str): # Добавлен model_name
+async def run_research_task(task_id: str, query: str, depth: int, breadth: int, model_name: str):
     """Выполняет исследование в фоновом режиме и обновляет статус задачи."""
     task = research_tasks[task_id]
     task.status = "running"
@@ -143,26 +135,23 @@ async def run_research_task(task_id: str, query: str, depth: int, breadth: int, 
 
     try:
         researcher = DeepResearcher(
-            api_key=GEMINI_API_KEY, # Передаем ключ
+            api_key=GEMINI_API_KEY,
             depth=depth,
             breadth=breadth,
-            model_name=model_name, # Используем выбранную модель
+            model_name=model_name,
             max_completion_tokens=8000
         )
 
-        def log_callback(log_message: str):
-            task.progress_log.append(log_message)
-            if task_id in task_events:
-                # Используем call_soon_threadsafe, если колбэк вызывается из другого потока
-                # Но т.к. DeepResearcher асинхронный, put_nowait должен быть безопасен
-                try:
-                    task_events[task_id].put_nowait("update")
-                except Exception as e:
-                     logger.error(f"Ошибка уведомления SSE для задачи {task_id}: {e}")
+        # Определяем колбэк внутри этой асинхронной функции
+        async def log_callback_async(log_message: str):
+             task.progress_log.append(log_message)
+             if task_id in task_events:
+                 try:
+                     task_events[task_id].put_nowait("update")
+                 except Exception as e:
+                      logger.error(f"Ошибка уведомления SSE для задачи {task_id}: {e}")
 
-
-        # Передаем асинхронный колбэк
-        final_report = await researcher.research(query, log_callback=log_callback)
+        final_report = await researcher.research(query, log_callback=log_callback_async) # Передаем асинхронный колбэк
 
         task.final_report = final_report
         task.status = "completed"
@@ -181,7 +170,7 @@ async def run_research_task(task_id: str, query: str, depth: int, breadth: int, 
     finally:
         if task_id in task_events:
              try:
-                task_events[task_id].put_nowait("update") # Финальное уведомление SSE
+                task_events[task_id].put_nowait("update")
              except Exception as e:
                  logger.error(f"Ошибка финального уведомления SSE для задачи {task_id}: {e}")
 
@@ -190,7 +179,6 @@ async def run_research_task(task_id: str, query: str, depth: int, breadth: int, 
 @app.get("/", response_class=HTMLResponse)
 async def get_index(request: Request):
     """Отдает главную HTML страницу со списком моделей."""
-    # Передаем список моделей и модель по умолчанию в шаблон
     return templates.TemplateResponse("index.html", {
         "request": request,
         "available_models": available_models,
@@ -202,7 +190,6 @@ async def start_research(
     request: ResearchRequest, background_tasks: BackgroundTasks
 ) -> Dict[str, str]:
     """Запускает новую задачу исследования в фоновом режиме."""
-    # Проверяем, доступна ли выбранная модель
     if request.model_name not in available_models:
          raise HTTPException(status_code=400, detail=f"Выбранная модель '{request.model_name}' недоступна.")
 
@@ -216,7 +203,7 @@ async def start_research(
         request.query,
         request.depth,
         request.breadth,
-        request.model_name # Передаем выбранную модель
+        request.model_name
     )
 
     return {"task_id": task_id, "message": "Исследование запущено"}
@@ -238,9 +225,5 @@ async def get_research_status(task_id: str) -> ResearchTask:
     return task
 
 # --- Запуск Uvicorn (для локальной разработки) ---
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.getenv("PORT", 8000))
-    logger.info(f"Запуск сервера на порту {port}")
-    # reload=True удобно для разработки, но может вызвать двойной запуск инициализации моделей
-    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
+# Блок if __name__ == "__main__": убран,
+# так как Gunicorn сам импортирует и запускает 'main:app'
