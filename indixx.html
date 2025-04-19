@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Deep Research Engine</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.0.6/purify.min.js"></script>
+</head>
+<body>
+    <div class="container">
+        <h1>Deep Research Engine</h1>
+
+        <form id="research-form">
+            <div>
+                <label for="query">Тема исследования:</label>
+                <input type="text" id="query" name="query" required placeholder="Например, 'Будущее квантовых вычислений'">
+            </div>
+             <!-- Выбор модели -->
+            <div>
+                <label for="model_name">Модель Gemini:</label>
+                <select id="model_name" name="model_name" required>
+                    {% for model in available_models %}
+                        <option value="{{ model }}" {% if model == default_model %}selected{% endif %}>
+                            {{ model }}
+                        </option>
+                    {% endfor %}
+                </select>
+            </div>
+            <div>
+                <label for="depth">Глубина (1-5):</label>
+                <input type="number" id="depth" name="depth" min="1" max="5" value="2" required>
+            </div>
+            <div>
+                <label for="breadth">Ширина (1-5):</label>
+                <input type="number" id="breadth" name="breadth" min="1" max="5" value="3" required>
+            </div>
+            <button type="submit" id="submit-button">Начать исследование</button>
+        </form>
+
+        <div id="error-message" class="error-message" style="display: none;"></div>
+
+        <h2>Лог выполнения:</h2>
+        <div id="progress-log">Ожидание запуска...</div>
+
+        <h2>Финальный отчет:</h2>
+        <div id="final-report">Ожидание завершения...</div>
+    </div>
+
+    <script>
+        const form = document.getElementById('research-form');
+        const submitButton = document.getElementById('submit-button');
+        const progressLog = document.getElementById('progress-log');
+        const finalReportDiv = document.getElementById('final-report');
+        const errorMessageDiv = document.getElementById('error-message');
+        let eventSource = null;
+
+        function renderMarkdown(mdContent) {
+            if (typeof marked === 'undefined' || typeof DOMPurify === 'undefined') {
+                console.error('Библиотеки marked или DOMPurify не загружены.');
+                const tempDiv = document.createElement('div');
+                tempDiv.textContent = mdContent; // Безопасный вывод как текст
+                return tempDiv.innerHTML;
+            }
+            // Очищаем HTML перед рендерингом Markdown
+            const cleanHtml = DOMPurify.sanitize(marked.parse(mdContent));
+            return cleanHtml;
+        }
+
+        function addLogEntry(message) {
+            if (progressLog.innerHTML === 'Ожидание запуска...') {
+                progressLog.innerHTML = '';
+            }
+            const logEntry = document.createElement('div');
+            logEntry.classList.add('log-entry');
+             // Используем textContent для безопасного вывода текста лога
+            logEntry.textContent = message;
+            progressLog.appendChild(logEntry);
+            progressLog.scrollTop = progressLog.scrollHeight;
+        }
+
+        function displayError(message) {
+            errorMessageDiv.textContent = `Ошибка: ${message}`;
+            errorMessageDiv.style.display = 'block';
+            submitButton.disabled = false;
+            if (eventSource) {
+                eventSource.close();
+            }
+        }
+
+        form.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            submitButton.disabled = true;
+            progressLog.innerHTML = 'Запуск исследования...';
+            finalReportDiv.innerHTML = 'Исследование выполняется...';
+            errorMessageDiv.style.display = 'none';
+
+            const formData = new FormData(form);
+            const data = Object.fromEntries(formData.entries());
+
+            if (eventSource) {
+                eventSource.close();
+            }
+
+            try {
+                const response = await fetch('/research', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        query: data.query,
+                        depth: parseInt(data.depth),
+                        breadth: parseInt(data.breadth),
+                        model_name: data.model_name // Отправляем выбранную модель
+                    }),
+                });
+
+                if (!response.ok) {
+                    const errorData = await response.json();
+                    throw new Error(errorData.detail || `HTTP ошибка: ${response.status}`);
+                }
+
+                const result = await response.json();
+                const taskId = result.task_id;
+                addLogEntry(`Задача исследования запущена (ID: ${taskId}). Ожидание обновлений...`);
+
+                eventSource = new EventSource(`/research/stream/${taskId}`);
+
+                eventSource.onmessage = function(event) {
+                    try {
+                        const eventData = JSON.parse(event.data);
+
+                        if (eventData.type === 'log') {
+                            addLogEntry(eventData.content);
+                        } else if (eventData.type === 'report') {
+                            finalReportDiv.innerHTML = renderMarkdown(eventData.content);
+                        } else if (eventData.type === 'status') {
+                            if (eventData.content === 'completed') {
+                                addLogEntry("Поток завершен: Исследование успешно выполнено.");
+                                eventSource.close();
+                                submitButton.disabled = false;
+                            } else if (eventData.content === 'failed') {
+                                addLogEntry("Поток завершен: Ошибка во время исследования.");
+                                eventSource.close();
+                                submitButton.disabled = false;
+                            }
+                        } else if (eventData.type === 'error') {
+                            displayError(eventData.content);
+                        }
+                    } catch (parseError) {
+                        console.error("Ошибка парсинга SSE данных:", parseError, "Данные:", event.data);
+                        addLogEntry(`Ошибка обработки данных от сервера: ${event.data}`);
+                    }
+                };
+
+                eventSource.onerror = function(error) {
+                    console.error("Ошибка SSE соединения:", error);
+                    addLogEntry("Ошибка соединения с сервером для получения обновлений.");
+                    displayError("Потеряно соединение с сервером.");
+                    if (eventSource) eventSource.close();
+                    submitButton.disabled = false;
+                };
+
+            } catch (error) {
+                console.error("Ошибка при запуске исследования:", error);
+                displayError(error.message || "Не удалось запустить исследование.");
+                submitButton.disabled = false;
+            }
+        });
+    </script>
+</body>
+</html>
