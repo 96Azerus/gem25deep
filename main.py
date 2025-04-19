@@ -1,4 +1,4 @@
-# main.py (v1.2.2 - Fixed google.api_core import)
+# main.py (v1.2.3 - Fixed list() call and error handling)
 import asyncio
 import os
 import uuid
@@ -13,11 +13,9 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 from sse_starlette.sse import EventSourceResponse
-# --- ИЗМЕНЕНИЯ ИМПОРТОВ ---
+# --- Используем новый SDK ---
 from google import genai
 from google.genai import types as genai_types
-# УБИРАЕМ импорт google.api_core
-# from google.api_core import exceptions as google_api_exceptions
 # ИМПОРТИРУЕМ ошибки из genai
 from google.genai import errors as genai_errors
 
@@ -39,8 +37,9 @@ logger = logging.getLogger(__name__)
 # --- Получение списка моделей Gemini ---
 available_models: List[str] = []
 try:
-    client = genai.Client() # Ключ из GOOGLE_API_KEY
-    models_list = client.models.list()
+    client = genai.Client()
+    # Используем config для page_size, как в документации
+    models_list = client.models.list(config={'page_size': 100}) # Запросим побольше сразу
 
     available_models = sorted([
         m.name.replace("models/", "") for m in models_list
@@ -80,11 +79,13 @@ try:
     logger.info(f"Модель по умолчанию: {DEFAULT_MODEL_NAME}")
 
 # --- ИЗМЕНЕНИЯ В ОБРАБОТКЕ ОШИБОК ---
-except genai_errors.PermissionDenied as e: # Используем genai_errors
-     logger.exception(f"Ошибка прав доступа Google API (проверьте ключ): {e}")
-     exit(1)
-except genai_errors.GoogleAPIError as e: # Используем базовый класс ошибок genai
-     logger.exception(f"Ошибка Google API при получении списка моделей Gemini: {e}")
+# Ловим только базовую ошибку API из genai.errors
+except genai_errors.APIError as e:
+     # Можно проверить e.code или e.message для специфики, если нужно
+     if hasattr(e, 'code') and e.code == 401: # Пример проверки на PermissionDenied
+          logger.exception(f"Ошибка прав доступа Google API (проверьте ключ): {e}")
+     else:
+          logger.exception(f"Ошибка Google API при получении списка моделей Gemini: {e}")
      exit(1)
 except Exception as e:
     logger.exception(f"Критическая ошибка при получении списка моделей Gemini: {e}")
@@ -233,12 +234,11 @@ async def run_research_task(task_id: str, query: str, depth: int, breadth: int, 
         task.error = str(e)
         task.progress_log.append(f"Ошибка исследования: {e}")
     # --- ИЗМЕНЕНИЯ В ОБРАБОТКЕ ОШИБОК ---
-    except genai_errors.GoogleAPIError as e: # Ловим базовую ошибку genai
+    except genai_errors.APIError as e: # Ловим базовую ошибку genai
         logger.error(f"Ошибка Google API в задаче {task_id}: {e}")
         task.status = "failed"
-        # Пытаемся получить сообщение об ошибке
         error_message = str(e)
-        if hasattr(e, 'message'): # Иногда сообщение есть в атрибуте message
+        if hasattr(e, 'message'):
              error_message = e.message
         task.error = f"Ошибка взаимодействия с Google API: {error_message}"
         task.progress_log.append(f"Ошибка Google API: {error_message}")
