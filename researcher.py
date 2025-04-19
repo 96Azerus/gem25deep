@@ -1,14 +1,12 @@
-# researcher.py (v1.2.2 - Fixed google.api_core import)
+# researcher.py (v1.2.3 - Fixed list() call and error handling)
 import asyncio
 import json
 import logging
 from typing import List, Dict, Any, Callable, Coroutine, Optional
 
-# --- ИЗМЕНЕНИЯ ИМПОРТОВ ---
+# --- Используем новый SDK ---
 from google import genai
 from google.genai import types as genai_types
-# УБИРАЕМ импорт google.api_core
-# from google.api_core import exceptions as google_api_exceptions
 # ИМПОРТИРУЕМ ошибки из genai
 from google.genai import errors as genai_errors
 from pydantic import BaseModel, Field, ValidationError
@@ -62,15 +60,23 @@ class DeepResearcher:
 
         # --- Инициализация клиента ---
         try:
-            self.client = genai.Client() # Ключ из GOOGLE_API_KEY
-            self.client.models.list(page_size=1)
+            self.client = genai.Client()
+            # --- ИЗМЕНЕНИЕ ВЫЗОВА list() ---
+            # Передаем page_size через config
+            self.client.models.list(config={'page_size': 1})
             logger.info(f"Клиент Google GenAI SDK для DeepResearcher инициализирован (модель по умолчанию: {self.model_name}).")
         # --- ИЗМЕНЕНИЯ В ОБРАБОТКЕ ОШИБОК ---
-        except genai_errors.PermissionDenied as e: # Используем genai_errors
-             logger.exception(f"Ошибка прав доступа при инициализации клиента GenAI: {e}")
-             raise ResearchError(f"Не удалось настроить Google GenAI SDK: Неверный API ключ или нет прав доступа. {e}") from e
+        # Ловим только базовую ошибку API из genai.errors
+        except genai_errors.APIError as e:
+             # Можно проверить e.code или e.message для специфики, если нужно
+             if hasattr(e, 'code') and e.code == 401: # Пример проверки на PermissionDenied
+                  logger.exception(f"Ошибка прав доступа при инициализации клиента GenAI: {e}")
+                  raise ResearchError(f"Не удалось настроить Google GenAI SDK: Неверный API ключ или нет прав доступа. {e}") from e
+             else:
+                  logger.exception(f"Ошибка Google API при инициализации клиента GenAI SDK: {e}")
+                  raise ResearchError(f"Не удалось настроить Google GenAI SDK: {e}") from e
         except Exception as e:
-             logger.exception(f"Ошибка инициализации клиента Google GenAI SDK: {e}")
+             logger.exception(f"Неизвестная ошибка при инициализации клиента Google GenAI SDK: {e}")
              raise ResearchError(f"Не удалось настроить Google GenAI SDK: {e}") from e
 
         self.all_knowledge: List[Dict[str, Any]] = []
@@ -183,26 +189,27 @@ class DeepResearcher:
                          raise ResearchError("GenAI вернул пустой текстовый ответ.")
 
         # --- ИЗМЕНЕНИЯ В ОБРАБОТКЕ ОШИБОК ---
-        # Ловим специфичные ошибки из genai.errors, если они там есть и нужны
-        except genai_errors.PermissionDenied as e:
-            await self._log(f"Ошибка прав доступа при вызове GenAI API: {e}")
-            raise ResearchError(f"Ошибка API ключа или прав доступа: {getattr(e, 'message', str(e))}") from e
-        except genai_errors.ResourceExhausted as e: # Если такой класс есть в genai.errors
-            await self._log(f"Превышена квота GenAI API: {e}")
-            raise ResearchError(f"Превышена квота Google API: {getattr(e, 'message', str(e))}") from e
-        except genai_errors.InvalidArgument as e: # Если такой класс есть в genai.errors
-             await self._log(f"Неверный аргумент при вызове GenAI API: {e}")
-             err_message = getattr(e, 'message', str(e))
-             # Проверяем текст ошибки на известные проблемы
-             if "API key not valid" in err_message:
-                  raise ResearchError("Ошибка API ключа Gemini. Проверьте ключ.") from e
-             if "JSON mode is not supported" in err_message or "Tool use is not supported" in err_message or "not found for model" in err_message:
-                  raise ResearchError(f"Выбранная модель '{self.model_name}' не поддерживает запрошенные функции (JSON, поиск) или не найдена.") from e
-             raise ResearchError(f"Неверный аргумент запроса к Google API: {err_message}") from e
-        # Ловим базовый класс ошибок API из genai.errors
+        # Ловим только базовую ошибку API из genai.errors
         except genai_errors.APIError as e:
-            await self._log(f"Общая ошибка Google API: {e}")
-            raise ResearchError(f"Ошибка при взаимодействии с Google API: {getattr(e, 'message', str(e))}") from e
+            await self._log(f"Ошибка Google API при вызове generate_content: {e}")
+            # Пытаемся извлечь полезную информацию из ошибки
+            error_message = str(e)
+            if hasattr(e, 'message'):
+                error_message = e.message
+
+            # Проверяем текст ошибки на известные проблемы
+            if "API key not valid" in error_message:
+                  raise ResearchError("Ошибка API ключа Gemini. Проверьте ключ.") from e
+            elif "JSON mode is not supported" in error_message or "Tool use is not supported" in error_message or "not found for model" in error_message:
+                  raise ResearchError(f"Выбранная модель '{self.model_name}' не поддерживает запрошенные функции (JSON, поиск) или не найдена.") from e
+            elif "quota" in error_message.lower(): # Проверка на квоту
+                 raise ResearchError(f"Превышена квота Google API: {error_message}") from e
+            # Добавляем проверку на PermissionDenied по коду, если возможно
+            elif hasattr(e, 'code') and e.code == 401:
+                 raise ResearchError(f"Ошибка прав доступа Google API: {error_message}") from e
+            else:
+                 # Общая ошибка API
+                 raise ResearchError(f"Ошибка при взаимодействии с Google API: {error_message}") from e
         # Ловим остальные ошибки
         except Exception as e:
             await self._log(f"Непредвиденная ошибка при вызове GenAI API: {e}")
@@ -210,7 +217,6 @@ class DeepResearcher:
             raise ResearchError(f"Непредвиденная ошибка при взаимодействии с GenAI API: {e}") from e
 
     # --- Методы логики исследования (без изменений в этой части) ---
-
     async def _generate_initial_queries(self, topic: str) -> List[SearchQuery]:
         prompt = f"""
         You are an AI research planning assistant.
@@ -427,9 +433,13 @@ class DeepResearcher:
                         else:
                              await self._log(f"No key insights found for query: '{result.get('original_query')}'")
                     elif isinstance(result, Exception):
+                         # Логируем ошибку, но не прерываем исследование из-за одной неудачи
                          error_msg = f"Error during search/extraction in iteration {iteration_num}: {result}"
                          await self._log(error_msg)
                          iteration_errors.append(error_msg)
+                         # Если это ResearchError, можно передать его сообщение в лог задачи
+                         if isinstance(result, ResearchError) and self.log_callback:
+                              asyncio.create_task(self.log_callback(f"Warning: {error_msg}"))
                     else:
                          await self._log(f"Unexpected result type during search/extraction: {type(result)}")
 
@@ -437,9 +447,10 @@ class DeepResearcher:
                 if iteration_errors:
                      await self._log(f"Iteration {iteration_num}: Encountered {len(iteration_errors)} errors.")
 
-                if not self.all_knowledge and iteration_num == 1:
-                    await self._log("Failed to gather any information in the first iteration. Aborting.")
-                    return "Failed to find relevant information in the initial research phase."
+                # Если все запросы на первой итерации завершились ошибкой, прерываем
+                if successful_results == 0 and iteration_num == 1:
+                    await self._log("Failed to gather any information in the first iteration due to errors. Aborting.")
+                    return "Failed to find relevant information in the initial research phase due to errors."
 
                 if iteration_num < self.depth:
                     try:
