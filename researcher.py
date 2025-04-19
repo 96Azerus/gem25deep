@@ -1,4 +1,4 @@
-# researcher.py (v1.2.4 - Fixed generate_content config argument name)
+# researcher.py (v1.2.5 - Removed unsupported request_options)
 import asyncio
 import json
 import logging
@@ -49,14 +49,14 @@ class DeepResearcher:
         breadth: int = 3,
         max_completion_tokens: int = 8192,
         temperature: float = 0.3,
-        request_timeout: int = 300
+        request_timeout: int = 300 # Оставляем параметр, но пока не используем
     ):
         self.depth = depth
         self.breadth = breadth
         self.model_name = model_name
         self.max_completion_tokens = max_completion_tokens
         self.temperature = temperature
-        self.request_timeout = request_timeout
+        self.request_timeout = request_timeout # Сохраняем на случай, если найдем способ применить
 
         # --- Инициализация клиента ---
         try:
@@ -123,7 +123,6 @@ class DeepResearcher:
              config_dict['tools'] = tools_list
 
         try:
-            # Создаем объект конфигурации, он нам все еще нужен
             generation_config_object = genai_types.GenerateContentConfig(**config_dict)
         except Exception as e:
              await self._log(f"Ошибка создания GenerateContentConfig: {e}")
@@ -133,12 +132,12 @@ class DeepResearcher:
             await self._log(f"Отправка запроса к GenAI (Модель: {full_model_name}, Схема: {response_schema is not None}, Поиск: {use_search_tool})...")
 
             # --- ИЗМЕНЕНИЕ ЗДЕСЬ ---
-            # Используем имя аргумента 'config', а не 'generation_config'
+            # Убираем request_options, так как он не поддерживается
             response = await self.client.aio.models.generate_content(
                 model=full_model_name,
                 contents=prompt,
-                config=generation_config_object, # Передаем объект конфигурации через аргумент 'config'
-                request_options={'timeout': self.request_timeout}
+                config=generation_config_object
+                # request_options={'timeout': self.request_timeout} # <-- УБРАНО
             )
             # -----------------------
 
