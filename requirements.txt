@@ -1,0 +1,10 @@
+# requirements.txt (v1.0.0)
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+gunicorn>=22.0.0
+google-generativeai>=0.7.2
+python-dotenv>=1.0.1
+jinja2>=3.1.4
+pydantic>=2.7.1
+aiohttp>=3.9.5 # Для асинхронных SSE
+sse-starlette>=2.1.0 # Для Server-Sent Events в FastAPI
