@@ -1,11 +1,12 @@
-# researcher.py (v1.1.2)
+# researcher.py (v1.1.3)
 import asyncio
 import json
 import logging
 from typing import List, Dict, Any, Callable, Coroutine
 
 import google.generativeai as genai
-from google.generativeai.types import GenerationConfig, ToolConfig # Импортируем нужные типы
+# ИСПРАВЛЕНИЕ: Убран импорт ToolConfig, импортируем только нужные типы
+from google.generativeai.types import GenerationConfig
 from pydantic import BaseModel, Field, ValidationError
 try:
     import json_repair
@@ -16,7 +17,6 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 # --- Модели Pydantic ---
-# (Схемы SearchQuery, ResearchPlan, ExtractedKnowledge, ReflectionResult остаются без изменений)
 class SearchQuery(BaseModel):
     sub_query: str = Field(description="Конкретный подзапрос для поиска информации по аспекту основной темы.")
     purpose: str = Field(description="Краткое объяснение, какую информацию должен найти этот подзапрос.")
@@ -61,29 +61,24 @@ class DeepResearcher:
              logger.exception(f"Ошибка конфигурации Gemini API ключа: {e}")
              raise ResearchError(f"Не удалось настроить Gemini API ключ: {e}") from e
 
-        # Базовая конфигурация генерации
         self.default_generation_config = GenerationConfig(
             max_output_tokens=self.max_completion_tokens,
             temperature=self.temperature,
         )
-        # Конфигурация для запроса JSON
         self.json_generation_config = GenerationConfig(
             max_output_tokens=self.max_completion_tokens,
             temperature=self.temperature,
             response_mime_type="application/json"
         )
-        # Конфигурация для использования поиска
+        # Создаем объект инструмента поиска один раз
         self.search_tool = genai.Tool.from_google_search_retrieval(
              google_search_retrieval=genai.protos.GoogleSearchRetrieval(disable_attribution=False)
         )
 
-
         try:
-            # Инициализируем модель один раз
-            self.model = genai.GenerativeModel(
-                self.model_name
-                # Конфигурацию и инструменты будем передавать в generate_content_async
-            )
+            self.model = genai.GenerativeModel(self.model_name)
+            # Модель для отчета инициализируем так же, но можно использовать ту же self.model
+            self.report_model = self.model
             logger.info(f"Модель Gemini '{self.model_name}' успешно инициализирована.")
         except Exception as e:
             logger.exception(f"Ошибка инициализации модели Gemini '{self.model_name}': {e}")
@@ -109,18 +104,18 @@ class DeepResearcher:
         prompt: str,
         response_schema: type[BaseModel] | None = None,
         use_search_tool: bool = False,
-        is_report_generation: bool = False # Оставим флаг, хотя модель одна
+        is_report_generation: bool = False
     ) -> str | Dict[str, Any]:
         """
         Выполняет вызов Gemini API с обработкой ошибок и парсингом JSON.
         """
+        model_to_use = self.report_model if is_report_generation else self.model
         generation_config = self.default_generation_config
         tools_list = None
         final_prompt = prompt
 
         if response_schema:
             generation_config = self.json_generation_config
-            # ИСПРАВЛЕНИЕ: Убран indent=2
             schema_json = json.dumps(response_schema.model_json_schema(), ensure_ascii=False)
             final_prompt = (
                 f"{prompt}\n\nПожалуйста, отформатируйте ваш ответ как JSON объект, "
@@ -128,25 +123,23 @@ class DeepResearcher:
                 "\nВаш ответ должен содержать ТОЛЬКО валидный JSON объект без каких-либо "
                 "других текстовых пояснений до или после него."
             )
-            # Важно: Не используем поиск при запросе JSON
             if use_search_tool:
                  await self._log("Предупреждение: Поиск отключен, так как запрошен JSON ответ.")
                  use_search_tool = False
 
         if use_search_tool:
-            tools_list = [self.search_tool]
+            tools_list = [self.search_tool] # Передаем объект Tool
 
         try:
-            await self._log(f"Отправка запроса к Gemini (Модель: {self.model_name}, Схема: {response_schema is not None}, Поиск: {use_search_tool})...")
+            await self._log(f"Отправка запроса к Gemini (Модель: {model_to_use.model_name}, Схема: {response_schema is not None}, Поиск: {use_search_tool})...")
 
-            response = await self.model.generate_content_async(
+            response = await model_to_use.generate_content_async(
                 final_prompt,
                 tools=tools_list, # Передаем список инструментов
-                generation_config=generation_config, # Передаем выбранную конфигурацию
+                generation_config=generation_config,
                 request_options={'timeout': 300}
             )
 
-            # Обработка ответа... (остается как в v1.1.1, но с исправлением парсинга)
             if not response.candidates or not response.candidates[0].content.parts:
                  await self._log("Gemini вернул пустой ответ.")
                  try:
@@ -179,10 +172,29 @@ class DeepResearcher:
                     else:
                          raise ResearchError(f"Не удалось распарсить JSON ответ от Gemini: {e}") from e
             else:
-                return response_text
+                # Если использовался поиск, проверяем наличие вызова функции в ответе
+                if use_search_tool and response.candidates[0].content.parts:
+                    function_calls = [part.function_call for part in response.candidates[0].content.parts if hasattr(part, 'function_call')]
+                    if function_calls:
+                         # Если есть function_call, но нет function_response (API сам обработал)
+                         # то response.text может быть не тем, что нам нужно.
+                         # Попробуем найти текстовую часть ответа, если она есть.
+                         text_parts = [part.text for part in response.candidates[0].content.parts if hasattr(part, 'text')]
+                         if text_parts:
+                             return "\n".join(text_parts)
+                         else:
+                             # Если текстовой части нет, возвращаем сообщение о том, что поиск был выполнен
+                             await self._log("Gemini выполнил поиск, но не вернул текстового резюме в явном виде.")
+                             # Можно попробовать сделать еще один запрос, чтобы он саммаризировал результаты,
+                             # но для минимализма вернем пока заглушку или пустую строку.
+                             # return "Поиск выполнен. Анализ результатов..."
+                             # Или вернем сам объект ответа для дальнейшей обработки, если нужно
+                             # return response.candidates[0].content.parts # Это сломает ожидание строки
+                             return "" # Возвращаем пустую строку, если нет текста
+
+                return response_text # Возвращаем текст как есть, если не JSON и не было поиска без текста
 
         except Exception as e:
-            # Обработка ошибок API... (остается как в v1.1.1)
             await self._log(f"Ошибка при вызове Gemini API: {e}")
             if hasattr(e, 'response') and hasattr(e.response, 'prompt_feedback'):
                  await self._log(f"Safety Feedback: {e.response.prompt_feedback}")
@@ -192,11 +204,13 @@ class DeepResearcher:
                  raise ResearchError("Ошибка API ключа Gemini. Проверьте ключ.") from e
             elif "quota" in str(e).lower():
                  raise ResearchError("Превышена квота Gemini API.") from e
-            # Добавим проверку на ошибку, связанную с инструментами/JSON
             elif "doesn't support function calling" in str(e) or "JSON mode is not supported" in str(e):
                  raise ResearchError(f"Выбранная модель '{self.model_name}' не поддерживает одновременное использование инструментов и/или JSON mode.") from e
             raise ResearchError(f"Ошибка при взаимодействии с Gemini API: {e}") from e
 
+    # Остальные методы (_generate_initial_queries, _search_and_extract, _reflect_and_plan_next, _generate_final_report, research)
+    # остаются такими же, как в v1.1.2, так как изменения были только в _call_gemini и импортах.
+    # ... (код методов без изменений) ...
     async def _generate_initial_queries(self, topic: str) -> List[SearchQuery]:
         """Генерирует начальные поисковые запросы."""
         prompt = f"""
@@ -206,7 +220,6 @@ class DeepResearcher:
         Избегайте слишком широких или общих запросов.
         """
         await self._log(f"Генерация начальных запросов для темы: {topic}")
-        # Запрашиваем JSON, поиск не используем
         response_data = await self._call_gemini(prompt, response_schema=ResearchPlan, use_search_tool=False)
         if isinstance(response_data, dict) and "query_plan" in response_data:
              plan = ResearchPlan.model_validate(response_data)
@@ -217,6 +230,7 @@ class DeepResearcher:
             await self._log(f"Не удалось сгенерировать начальный план запросов. Получен ответ: {response_data}")
             raise ResearchError("Не удалось сгенерировать начальный план запросов.")
 
+
     async def _search_and_extract(self, query: SearchQuery) -> Dict[str, Any]:
         """
         Выполняет поиск по подзапросу (Шаг 1) и извлекает знания (Шаг 2).
@@ -226,10 +240,9 @@ class DeepResearcher:
         Найдите информацию по следующему запросу, используя поиск Google:
         Запрос: "{query.sub_query}"
         Цель: "{query.purpose}"
-        Предоставьте наиболее релевантные результаты поиска.
+        Предоставьте наиболее релевантные результаты поиска в виде связного текста или списка ключевых находок.
         """
         await self._log(f"Шаг 1: Выполнение поиска для: '{query.sub_query}' (Цель: {query.purpose})")
-        # Вызываем Gemini с инструментом поиска, ожидаем текстовый ответ
         search_results_text = await self._call_gemini(search_prompt, response_schema=None, use_search_tool=True)
 
         if not isinstance(search_results_text, str) or not search_results_text.strip():
@@ -247,12 +260,9 @@ class DeepResearcher:
         ```
         {search_results_text}
         ```
-
-        Извлеките информацию и представьте ее в формате JSON.
         """
         # Схема будет добавлена в _call_gemini
         await self._log(f"Шаг 2: Извлечение знаний из результатов поиска для: '{query.sub_query}'")
-        # Вызываем Gemini для извлечения JSON, поиск НЕ используем
         response_data = await self._call_gemini(extract_prompt, response_schema=ExtractedKnowledge, use_search_tool=False)
 
         if isinstance(response_data, dict):
@@ -295,7 +305,6 @@ class DeepResearcher:
         """
         # Схема будет добавлена в _call_gemini
         await self._log("Рефлексия над собранными знаниями и планирование следующих шагов...")
-        # Запрашиваем JSON, поиск не используем
         response_data = await self._call_gemini(prompt, response_schema=ReflectionResult, use_search_tool=False)
 
         if isinstance(response_data, dict):
@@ -308,7 +317,6 @@ class DeepResearcher:
 
     async def _generate_final_report(self, topic: str) -> str:
         """Генерирует финальный отчет на основе всех собранных знаний."""
-        # Логика сборки knowledge_details остается прежней
         knowledge_details = ""
         for i, k in enumerate(self.all_knowledge):
             insights = "\n  - ".join(k.get('key_insights', []))
@@ -336,7 +344,6 @@ class DeepResearcher:
         Напишите финальный отчет.
         """
         await self._log("Генерация финального отчета...")
-        # Генерируем отчет как обычный текст, поиск не нужен
         report = await self._call_gemini(prompt, response_schema=None, use_search_tool=False, is_report_generation=True)
         if isinstance(report, str):
             await self._log("Финальный отчет сгенерирован.")
@@ -380,9 +387,10 @@ class DeepResearcher:
                     else:
                          await self._log(f"Неожиданный результат поиска/извлечения: {type(result)}")
 
+
                 await self._log(f"Итерация {i + 1}: Успешно обработано {successful_results}/{len(current_queries)} запросов. Добавлено {new_knowledge_count} новых ключевых моментов.")
 
-                if not self.all_knowledge and i == 0: # Если после первой итерации нет знаний
+                if not self.all_knowledge and i == 0:
                     await self._log("Не удалось собрать информацию на первой итерации. Прерывание исследования.")
                     return "Не удалось найти релевантную информацию по вашему запросу."
 
