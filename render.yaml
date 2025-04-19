@@ -1,0 +1,21 @@
+# render.yaml (v1.0.0)
+# Blueprint for deploying the Deep Research Engine on Render.com
+
+services:
+  - type: web # Тип сервиса - веб-приложение
+    name: deep-research-engine # Имя сервиса на Render
+    runtime: docker # Среда выполнения - Docker
+    repo: https://github.com/<ваш-github-юзер>/<имя-репозитория> # Замените на URL вашего репозитория
+    branch: main # Ветка для деплоя
+    # Dockerfile находится в корне, Render найдет его автоматически
+    # DockerfilePath: ./Dockerfile
+    # Start Command будет взят из CMD в Dockerfile
+    # healthCheckPath: /health # Опционально: добавьте эндпоинт для проверки здоровья
+    envVars:
+      - key: PYTHON_VERSION # Указываем версию Python для Render (хотя Dockerfile важнее)
+        value: 3.11
+      - key: GEMINI_API_KEY
+        sync: false # Указываем, что это секретная переменная, задается в UI Render
+      # Можно добавить другие переменные окружения здесь или в UI Render
+      # - key: RESEARCH_MODEL_NAME
+      #   value: gemini-2.5-pro-preview-03-25
