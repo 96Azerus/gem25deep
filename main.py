@@ -1,4 +1,4 @@
-# main.py (v1.1.1)
+# main.py (v1.1.2)
 import asyncio
 import os
 import uuid
@@ -39,12 +39,30 @@ try:
         m.name.replace("models/", "") for m in models_list
         if 'generateContent' in m.supported_generation_methods and 'embedding' not in m.name
     ])
-    if DEFAULT_MODEL_NAME not in available_models and available_models:
-        logger.warning(f"Модель по умолчанию '{DEFAULT_MODEL_NAME}' не найдена в доступных. Используется первая доступная: '{available_models[0]}'")
-        DEFAULT_MODEL_NAME = available_models[0]
-    elif not available_models:
-         logger.error("Не удалось получить список доступных моделей Gemini.")
-         available_models = [DEFAULT_MODEL_NAME]
+    # Проверяем, существует ли модель по умолчанию в списке доступных
+    if DEFAULT_MODEL_NAME not in available_models:
+        # Если модель по умолчанию недоступна, пытаемся найти другую подходящую
+        fallback_models = [
+            "gemini-1.5-flash-latest", # Предпочитаем flash для скорости/стоимости
+            "gemini-1.5-pro-latest",   # Затем pro
+            "gemini-2.5-pro-preview-03-25", # Затем 2.5 preview
+            "gemini-2.5-flash-preview-04-17" # Затем 2.5 flash preview
+        ]
+        found_fallback = False
+        for model in fallback_models:
+            if model in available_models:
+                logger.warning(f"Модель по умолчанию '{DEFAULT_MODEL_NAME}' не найдена. Используется fallback: '{model}'")
+                DEFAULT_MODEL_NAME = model
+                found_fallback = True
+                break
+        # Если даже fallback не найден, берем первую из списка
+        if not found_fallback and available_models:
+             logger.warning(f"Модель по умолчанию '{DEFAULT_MODEL_NAME}' и fallback модели не найдены. Используется первая доступная: '{available_models[0]}'")
+             DEFAULT_MODEL_NAME = available_models[0]
+        elif not available_models:
+             logger.error("Не удалось получить список доступных моделей Gemini. Используется жестко заданная модель по умолчанию.")
+             available_models = [DEFAULT_MODEL_NAME] # Используем дефолтную, если список пуст
+
     logger.info(f"Доступные модели Gemini: {available_models}")
     logger.info(f"Модель по умолчанию: {DEFAULT_MODEL_NAME}")
 
@@ -142,7 +160,6 @@ async def run_research_task(task_id: str, query: str, depth: int, breadth: int, 
             max_completion_tokens=8000
         )
 
-        # Определяем колбэк внутри этой асинхронной функции
         async def log_callback_async(log_message: str):
              task.progress_log.append(log_message)
              if task_id in task_events:
@@ -151,7 +168,7 @@ async def run_research_task(task_id: str, query: str, depth: int, breadth: int, 
                  except Exception as e:
                       logger.error(f"Ошибка уведомления SSE для задачи {task_id}: {e}")
 
-        final_report = await researcher.research(query, log_callback=log_callback_async) # Передаем асинхронный колбэк
+        final_report = await researcher.research(query, log_callback=log_callback_async)
 
         task.final_report = final_report
         task.status = "completed"
@@ -225,5 +242,4 @@ async def get_research_status(task_id: str) -> ResearchTask:
     return task
 
 # --- Запуск Uvicorn (для локальной разработки) ---
-# Блок if __name__ == "__main__": убран,
-# так как Gunicorn сам импортирует и запускает 'main:app'
+# Убран блок if __name__ == "__main__": для совместимости с Gunicorn
